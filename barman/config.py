@@ -26,6 +26,7 @@ import inspect
 import logging.handlers
 import os
 import re
+import socket
 import sys
 from glob import iglob
 
@@ -60,7 +61,14 @@ _TIME_INTERVAL_RE = re.compile(r"""
 REUSE_BACKUP_VALUES = ('copy', 'link', 'off')
 
 # Possible copy methods for backups (must be all lowercase)
-BACKUP_METHOD_VALUES = ['rsync', 'postgres']
+BACKUP_METHOD_VALUES = ['rsync', 'postgres', 'incr']
+
+# Possible compression options for incr
+INCR_COMPRESS_VALUES = ['none', 'gzip', 'bzip2', 'lzma']
+for i in ['gzip', 'bzip2', 'lzma']:
+    INCR_COMPRESS_VALUES += map(lambda x: i + '-' + str(x), range(1, 10))
+
+INCR_ALLOW_ROOT_VALUES = ['full', 'incr']
 
 
 class CsvOption(set):
@@ -260,6 +268,42 @@ def parse_backup_method(value):
             "', '".join(BACKUP_METHOD_VALUES)))
 
 
+def parse_incr_compress(value):
+    """
+    Parse a string to a valid incr_compress value.
+
+    Valid values are contained in INCR_COMPRESS_VALUES list
+
+    :param str value: incr_compress value
+    :raises ValueError: if the value is invalid
+    """
+    if value is None:
+        return 'none'
+    if value.lower() in INCR_COMPRESS_VALUES:
+        return value.lower()
+    raise ValueError(
+        "Invalid value (must be one in: '%s')" % (
+            "', '".join(INCR_COMPRESS_VALUES)))
+
+
+def parse_incr_allow_root(value):
+    """
+    Parse a string to a valid incr_allow_root value.
+
+    Valid values are contained in INCR_ALLOW_ROOT_VALUES list
+
+    :param str value: incr_allow_root value
+    :raises ValueError: if the value is invalid
+    """
+    if value is None:
+        return 'none'
+    if value.lower() in INCR_ALLOW_ROOT_VALUES:
+        return value.lower()
+    raise ValueError(
+        "Invalid value (must be one in: '%s')" % (
+            "', '".join(INCR_ALLOW_ROOT_VALUES)))
+
+
 class ServerConfig(object):
     """
     This class represents the configuration for a specific Server instance.
@@ -286,6 +330,14 @@ class ServerConfig(object):
         'errors_directory',
         'immediate_checkpoint',
         'incoming_wals_directory',
+        'incr_allow_root',
+        'incr_compress',
+        'incr_host',
+        'incr_max_increments',
+        'incr_parallel',
+        'incr_rsync_options',
+        'incr_rsync_relpath',
+        'incr_extra_args',
         'last_backup_maximum_age',
         'minimum_redundancy',
         'network_compression',
@@ -329,6 +381,14 @@ class ServerConfig(object):
         'custom_compression_filter',
         'custom_decompression_filter',
         'immediate_checkpoint',
+        'incr_allow_root',
+        'incr_compress',
+        'incr_host',
+        'incr_max_increments',
+        'incr_parallel',
+        'incr_rsync_options',
+        'incr_rsync_relpath',
+        'incr_extra_args',
         'last_backup_maximum_age',
         'minimum_redundancy',
         'network_compression',
@@ -369,6 +429,11 @@ class ServerConfig(object):
         'errors_directory': '%(backup_directory)s/errors',
         'immediate_checkpoint': 'false',
         'incoming_wals_directory': '%(backup_directory)s/incoming',
+        'incr_allow_root': 'incr',
+        'incr_compress': 'gzip',
+        'incr_host': 'barman@' + socket.getfqdn(),
+        'incr_max_increments': '6',
+        'incr_parallel': '1',
         'minimum_redundancy': '0',
         'network_compression': 'false',
         'recovery_options': '',
@@ -398,6 +463,10 @@ class ServerConfig(object):
         'check_timeout': int,
         'disabled': parse_boolean,
         'immediate_checkpoint': parse_boolean,
+        'incr_allow_root': parse_incr_allow_root,
+        'incr_compress': parse_incr_compress,
+        'incr_max_increments': int,
+        'incr_parallel': int,
         'last_backup_maximum_age': parse_time_interval,
         'network_compression': parse_boolean,
         'recovery_options': RecoveryOptions,

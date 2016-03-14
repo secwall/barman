@@ -56,6 +56,9 @@ if sys.version_info < (2, 7):
         'argparse',
     ]
 
+if sys.version_info < (3, 3):
+    install_requires.append('backports.lzma')
+
 barman = {}
 with open('barman/version.py', 'r') as fversion:
     exec(fversion.read(), barman)
@@ -67,7 +70,7 @@ setup(
     author_email='info@2ndquadrant.it',
     url='http://www.pgbarman.org/',
     packages=['barman', ],
-    scripts=['bin/barman', ],
+    scripts=['bin/barman', 'bin/barman-incr'],
     data_files=[
         ('share/man/man1', ['doc/barman.1']),
         ('share/man/man5', ['doc/barman.5']),

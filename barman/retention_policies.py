@@ -164,11 +164,16 @@ class RedundancyRetentionPolicy(RetentionPolicy):
         # Non DONE backups are classified as NONE
         # NOTE: reverse key orders (simulate reverse chronology)
         i = 0
+        required = set()
         for bid in sorted(backups.keys(), reverse=True):
             if backups[bid].status == BackupInfo.DONE:
                 if i < redundancy:
                     report[bid] = BackupInfo.VALID
                     self._first_backup = bid
+                    for i in self.server.backup_manager.get_restore_path(bid):
+                        required.add(i)
+                elif bid in required:
+                    report[bid] = BackupInfo.POTENTIALLY_OBSOLETE
                 else:
                     report[bid] = BackupInfo.OBSOLETE
                 i = i + 1
@@ -253,6 +258,7 @@ class RecoveryWindowRetentionPolicy(RetentionPolicy):
         # Non DONE backups are classified as NONE
         found = False
         valid = 0
+        required = set()
         # NOTE: reverse key orders (simulate reverse chronology)
         for bid in sorted(backups.keys(), reverse=True):
             # We are interested in DONE backups only
@@ -267,6 +273,18 @@ class RecoveryWindowRetentionPolicy(RetentionPolicy):
                             bid, self.server.config.name,
                             self._point_of_recoverability(),
                             self.server.config.minimum_redundancy)
+                        # We mark the backup as potentially obsolete
+                        # as we must respect minimum redundancy requirements
+                        report[bid] = BackupInfo.POTENTIALLY_OBSOLETE
+                        self._first_backup = bid
+                        valid = valid + 1
+                    elif bid in required:
+                        _logger.warning(
+                            "Keeping obsolete backup %s for server %s "
+                            "(older than %s) "
+                            "as required for restore of newer backups",
+                            bid, self.server.config.name,
+                            self._point_of_recoverability())
                         # We mark the backup as potentially obsolete
                         # as we must respect minimum redundancy requirements
                         report[bid] = BackupInfo.POTENTIALLY_OBSOLETE
@@ -297,6 +315,10 @@ class RecoveryWindowRetentionPolicy(RetentionPolicy):
                         found = True
             else:
                 report[bid] = BackupInfo.NONE
+            if report[bid] in [BackupInfo.POTENTIALLY_OBSOLETE,
+                               BackupInfo.VALID]:
+                for i in self.server.backup_manager.get_restore_path(bid):
+                    required.add(i)
         return report
 
     def _wal_report(self):

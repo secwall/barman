@@ -135,7 +135,7 @@ class TestRsyncBackupExecutor(object):
         assert err == ''
         assert 'ssh: FAILED' in out
 
-    @patch("barman.backup.RsyncBackupExecutor.backup_copy")
+    @patch("barman.backup_executor.RsyncBackupExecutor.backup_copy")
     @patch("barman.backup.BackupManager.get_previous_backup")
     @patch("barman.backup.BackupManager.remove_wal_before_backup")
     def test_backup(self, rwbb_mock, gpb_mock, backup_copy_mock,

@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import shutil
+import time
 from abc import ABCMeta, abstractmethod
 from functools import partial
 
@@ -157,6 +158,17 @@ class BackupExecutor(with_metaclass(ABCMeta, RemoteStatusMixin)):
                     output.info("\t%s from server %s "
                                 "has been removed",
                                 wal_name, self.config.name)
+
+    def factory(manager):
+        if manager.config.backup_method == 'rsync':
+            return RsyncBackupExecutor(manager)
+        elif manager.config.backup_method == 'postgres':
+            return PostgresBackupExecutor(manager)
+        elif manager.config.backup_method == 'incr':
+            return IncrementalBackupExecutor(manager)
+        assert 0, "Bad backup_method: " + manager.config.backup_method
+
+    factory = staticmethod(factory)
 
 
 def _parse_ssh_command(ssh_command):
@@ -1040,6 +1052,188 @@ class RsyncBackupExecutor(SshBackupExecutor):
                 return previous_backup_info.get_data_directory(oid)
             except ValueError:
                 return None
+
+
+class IncrementalBackupExecutor(SshBackupExecutor):
+    """
+    Concrete class for backup via page-incremental script over ssh.
+
+    It invokes PostgreSQL commands to start and stop the backup, depending
+    on the defined strategy. Data files are copied using backup script.
+    It heavily relies on methods defined in the SshBackupExecutor class
+    from which it derives.
+    """
+
+    def __init__(self, backup_manager):
+        """
+        Constructor
+
+        :param barman.backup.BackupManager backup_manager: the BackupManager
+            assigned to the strategy
+        """
+        super(IncrementalBackupExecutor, self).__init__(backup_manager, 'incr')
+
+    def check(self, check_strategy):
+        """
+        Perform additional checks for IncrementalBackupExecutor, including
+        Ssh connection (executing 'which barman-incr' on the remote server)
+        and specific checks for the given backup strategy.
+
+        :param CheckStrategy check_strategy: the strategy for the management
+             of the results of the various checks
+        """
+
+        # Execute a 'true' command on the remote server
+        cmd = UnixRemoteCommand(self.ssh_command,
+                                self.ssh_options,
+                                path=self.server.path)
+        ret = cmd.cmd("which barman-incr")
+        hint = "barman-incr"
+        if ret == 0:
+            check_strategy.result(self.config.name, 'ssh', True,
+                                  hint)
+        else:
+            check_strategy.result(self.config.name, 'ssh', False,
+                                  '%s, return code: %s' % (hint, ret))
+
+        if self.server.postgres.server_version >= 90300:
+            check_strategy.result(self.config.name, 'version', True,
+                                  'ok')
+        else:
+            check_strategy.result(self.config.name, 'version', False,
+                                  'unsupported version (use >= 9.3 for incr)')
+        try:
+            # Invoke specific checks for the backup strategy
+            self.strategy.check(check_strategy)
+        except BaseException:
+            self._update_action_from_strategy()
+            raise
+
+    def backup_copy(self, backup_info):
+        """
+        Perform the actual copy of the backup using barman-incr.
+        Bandwidth limitation, according to configuration, is applied in
+        the process.
+        This method is the core of base backup copy using barman-incr+ssh.
+
+        :param barman.infofile.BackupInfo backup_info: backup information
+        """
+
+        # Retrieve the previous backup metadata, then check if we could
+        # make new increment
+        previous_backup = self.backup_manager.get_previous_backup(
+            backup_info.backup_id)
+        lsn = None
+        if previous_backup and previous_backup.incr_compress is not None:
+            p = self.backup_manager.get_restore_path(previous_backup.backup_id)
+            increments = len(p) - 1
+            if self.config.incr_allow_root == 'full':
+                previous_backup = p[0]
+                increments = len(
+                    self.backup_manager.get_increments(
+                        previous_backup.backup_id))
+            if increments < self.config.incr_max_increments:
+                u, l = previous_backup.begin_xlog.split('/')
+                prev_lsn = (int(u, 16) << 32) + int(l, 16)
+                u, l = backup_info.begin_xlog.split('/')
+                cur_lsn = (int(u, 16) << 32) + int(l, 16)
+                if cur_lsn >= prev_lsn and \
+                        previous_backup.timeline == backup_info.timeline:
+                    backup_info.incr_lsn = previous_backup.begin_xlog
+                    lsn = str(prev_lsn)
+
+        backup_info.incr_compress = self.config.incr_compress
+        backup_info.save()
+
+        backup_dest = backup_info.get_data_directory()
+        mkpath(backup_dest)
+
+        rsync_options = []
+
+        if self.config.network_compression:
+            rsync_options.append('-z')
+
+        if self.config.incr_rsync_options:
+            rsync_options += filter(lambda x: len(x) > 0,
+                                    self.config.incr_rsync_options.split())
+
+        options = []
+
+        if rsync_options:
+            options += ['-R', '" ' + ' '.join(rsync_options) + '"']
+
+        include_files = []
+
+        for key in ('config_file', 'hba_file', 'ident_file'):
+            cf = getattr(backup_info, key, None)
+            if cf:
+                assert isinstance(cf, str)
+                if not cf.startswith(backup_info.pgdata):
+                    include_files.append(cf)
+
+        if backup_info.included_files:
+            filtered_files = [
+                included_file
+                for included_file in backup_info.included_files
+                if not included_file.startswith(backup_info.pgdata)
+            ]
+            if len(filtered_files) > 0:
+                output.warning(
+                    "The usage of include directives is not supported "
+                    "for files that reside outside PGDATA.\n"
+                    "Please manually backup the following files:\n"
+                    "\t%s\n",
+                    "\n\t".join(filtered_files)
+                )
+
+        if include_files:
+            options += ['-i', ','.join(include_files)]
+
+        if lsn is not None:
+            flist = os.path.join(previous_backup.get_data_directory(),
+                                 'file.list')
+            if self.config.incr_rsync_relpath:
+                flist = '/' + \
+                        os.path.relpath(flist, self.config.incr_rsync_relpath)
+            ts = int(time.mktime(previous_backup.begin_time.timetuple()))
+            options += ['-l', lsn, '-f', self.config.incr_host + ':' +
+                        flist, '-a', str(ts)]
+
+        if self.config.bandwidth_limit:
+            options += ['-w', str(self.config.bandwidth_limit)]
+
+        t = self.config.tablespace_bandwidth_limit
+        tsp_bwlims = []
+        tsps = []
+        if backup_info.tablespaces:
+            for tablespace in backup_info.tablespaces:
+                tsps.append(str(tablespace.oid) + ':' +
+                            str(tablespace.location))
+                if t and tablespace.name in t:
+                    tsp_bwlims.append(str(tablespace.oid) + ':' +
+                                      str(t[tablespace.name]))
+            if tsps:
+                options += ['-T', ','.join(tsps)]
+            if tsp_bwlims:
+                options += ['-W', ','.join(tsp_bwlims)]
+
+        if self.config.incr_extra_args:
+            options += self.config.incr_extra_args.split()
+
+        bkup_path = backup_info.get_data_directory()
+        if self.config.incr_rsync_relpath:
+            bkup_path = '/' + os.path.relpath(bkup_path,
+                                              self.config.incr_rsync_relpath)
+        bkup = UnixRemoteCommand(self.ssh_command, self.ssh_options,
+                                 path=self.server.path)
+        res = bkup.cmd('barman-incr -D %s -p %d %s -c %s -b %s backup' % (
+            backup_info.pgdata, self.config.incr_parallel,
+            ' '.join(options), self.config.incr_compress,
+            self.config.incr_host + ':' + bkup_path))
+        for l in bkup.cmd.err.splitlines():
+            _logger.info(l.rstrip())
+        if res != 0:
+            raise FsOperationFailed('Unable to run barman-incr on remote host')
 
 
 class BackupStrategy(with_metaclass(ABCMeta, object)):

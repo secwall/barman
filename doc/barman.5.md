@@ -79,7 +79,8 @@ backup_method
 :   Configure the method barman used for backup execution.
     If set to `rsync` (default), barman will execute backup using the `rsync`
     command. If set to `postgres` barman will use the `pg_basebackup` command
-    to execute the backup. Global/Server.
+    to execute the backup. Global/Server. If set to `incr` barman will use the
+    `barman-incr` agent on database host to execute the backup.
 
 backup_options
 :   This option allows you to control the way Barman interacts with PostgreSQL
@@ -326,6 +327,46 @@ wal_retention_policy
 
 wals_directory
 :   Directory which contains WAL files. Server.
+
+incr_allow_root
+:   Allow sequences of incremental backups.
+    Valid values are `incr` (e.g. allow) and `full` (take increments only
+    based on full-backups, so restore path will be always no more than 2).
+    Global/Server.
+
+incr_compress
+:   How to compress incremental backups.
+    `none` disables compression at all.
+    `gzip`, `bzip` or `lzma` enables compression using selected method.
+    Compression level (1-9) using value could be set using `<algo>-<level>`
+    value. Default compression level is 6.
+    Global/Server.
+
+incr_host
+:   Barman host backup upload.
+    Global/Server.
+
+incr_max_increments
+:   Max increments before taking another full backup. `6` by default.
+    Global/Server.
+
+incr_parallel
+:   Number of agent workers. `1` by default.
+    Global/Server.
+
+incr_rsync_options
+:   Additional options to rsync running by agent.
+    Global/Server.
+
+incr_rsync_relpath
+:   Pass relative path to barman-incr.
+    If you announced `/var/lib/barman` via rsync as `barman` you need to set
+    `/var/lib` here.
+    Global/Server.
+
+incr_extra_args
+:   Pass extra args to barman-incr.
+    Global/Server.
 
 # HOOK SCRIPTS
 

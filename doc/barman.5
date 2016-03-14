@@ -106,6 +106,8 @@ If set to \f[C]rsync\f[] (default), barman will execute backup using the
 \f[C]rsync\f[] command.
 If set to \f[C]postgres\f[] barman will use the \f[C]pg_basebackup\f[]
 command to execute the backup.
+If set to \f[C]incr\f[] barman will use the \f[C]barman-incr\f[]
+agent on database host to execute the backup.
 Global/Server.
 .RS
 .RE
@@ -506,6 +508,63 @@ Global/Server.
 .B wals_directory
 Directory which contains WAL files.
 Server.
+.RS
+.RE
+.TP
+.B incr_allow_root
+Allow sequences of incremental backups.
+Valid values are \f[C]incr\f[] (e.g. allow) and \f[C]full\f[] (take increments
+only based on full-backups, so restore path will be always no more than 2).
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_compress
+How to compress incremental backups.
+\f[C]none\f[] disables compression at all.
+\f[C]gzip\f[], \f[C]bzip\f[] or \f[C]lzma\f[] enables compression using
+selected method.
+Compression level (1-9) using value could be set using \f[C]<algo>-<level>\f[]
+value. Default compression level is 6.
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_host
+Barman host backup upload.
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_max_increments
+Max increments before taking another full backup. \f[C]6\f[] by default.
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_parallel
+Number of agent workers. \f[C]1\f[] by default.
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_rsync_options
+Additional options to rsync running by agent.
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_rsync_relpath
+Pass relative path to barman-incr.
+If you announced \f[C]/var/lib/barman\f[] via rsync as \f[C]barman\f[]
+you need to set \f[C]/var/lib\f[] here.
+Global/Server.
+.RS
+.RE
+.TP
+.B incr_extra_args
+Pass extra args to barman-incr.
+Global/Server.
 .RS
 .RE
 .SH HOOK SCRIPTS

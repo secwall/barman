@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
+import socket
 from datetime import datetime, timedelta
 from shutil import rmtree
 
@@ -239,6 +240,14 @@ def build_config_dictionary(config_keys=None):
         'description': ' Text with quotes ',
         'immediate_checkpoint': False,
         'incoming_wals_directory': '/some/barman/home/main/incoming',
+        'incr_allow_root': 'incr',
+        'incr_compress': 'gzip',
+        'incr_host': 'barman@' + socket.getfqdn(),
+        'incr_max_increments': 6,
+        'incr_parallel': 1,
+        'incr_rsync_options': None,
+        'incr_rsync_relpath': None,
+        'incr_extra_args': None,
         'minimum_redundancy': '0',
         'name': 'main',
         'network_compression': False,

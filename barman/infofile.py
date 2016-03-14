@@ -437,6 +437,8 @@ class BackupInfo(FieldListFile):
     server_name = Field('server_name')
     error = Field('error')
     mode = Field('mode')
+    incr_lsn = Field('incr_lsn')
+    incr_compress = Field('incr_compress')
     config_file = Field('config_file')
     hba_file = Field('hba_file')
     ident_file = Field('ident_file')

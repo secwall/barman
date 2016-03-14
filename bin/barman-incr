@@ -1,0 +1,608 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from __future__ import absolute_import, print_function, unicode_literals
+
+import argparse
+import bz2
+import fnmatch
+import functools
+import gzip
+import logging
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import traceback
+from collections import namedtuple
+from multiprocessing import Pool
+
+import msgpack
+
+if sys.version_info < (3, 3):
+    from backports import lzma
+else:
+    import lzma
+
+log = None
+
+Config = namedtuple('Config', ['block_size', 'magic', 'pgdata',
+                               'lsn', 'last_ts', 'backup_path',
+                               'exclude_list', 'input_file_list',
+                               'start_time', 'processed_file_list',
+                               'tmpdir', 'compress', 'rsync_args',
+                               'rsync_retries', 'retries_pause'])
+
+
+def get_compression_opener(config):
+    if '-' in config.compress:
+        compress, level = config.compress.split('-')
+        level = int(level)
+    else:
+        compress = config.compress
+        level = 6
+    if compress == 'gzip':
+        if sys.version_info < (2, 7):
+            class GZHack(gzip.GzipFile):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, type, value, tb):
+                    self.close()
+
+            return functools.partial(GZHack, compresslevel=level)
+        else:
+            return functools.partial(gzip.open, compresslevel=level)
+    elif compress == 'lzma':
+        return functools.partial(lzma.open, preset=level)
+    elif compress == 'bzip2':
+        return functools.partial(bz2.BZ2File, compresslevel=level)
+    else:
+        return open
+
+
+def file_size(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        size = os.fstat(fd).st_size
+        os.close(fd)
+        return size
+    except Exception:
+        return -1
+
+
+def mkdir(path):
+    try:
+        os.makedirs(path, mode=0o700)
+    except Exception as e:
+        if not os.path.isdir(os.path.abspath(path)):
+            raise e
+
+
+def rsync_call(src, dest, config):
+    cmd = 'rsync %s %s %s' % (config.rsync_args, src, dest)
+    t = 0
+    while t < config.rsync_retries:
+        log.info(cmd)
+        p = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+        if p.wait() != 0:
+            log.error(p.stdout.read())
+            log.error(p.stderr.read())
+            t += 1
+            if t < config.rsync_retries:
+                time.sleep(config.retries_pause)
+        else:
+            return
+
+    raise RuntimeError("rsync failed")
+
+
+def restore_file(path, config):
+    try:
+        tmp = os.path.join(config.tmpdir, path)
+        mkdir(os.path.dirname(tmp))
+        full_path = os.path.join(config.pgdata, path)
+
+        rsync_call(os.path.join(config.backup_path, path), tmp, config)
+
+        with get_compression_opener(config)(tmp, 'rb') as inp:
+            pages = []
+            try:
+                u = msgpack.Unpacker(inp)
+                num = u.read_array_header() - 1
+                if u.unpack() == config.magic:
+                    for i in range(num):
+                        pages.append(u.unpack())
+                else:
+                    pages = None
+            except Exception:
+                pages = None
+
+            mkdir(os.path.dirname(full_path))
+            if pages is not None:
+                if pages:
+                    with open(full_path, 'rb+') as out:
+                        inp.seek(len(msgpack.packb([config.magic] + pages)))
+                        for p in pages:
+                            buf = inp.read(config.block_size)
+                            if len(buf) != config.block_size:
+                                raise RuntimeError(
+                                    path + ": Unable to read page %d" % p)
+                            correct, _ = parse_page(buf[:24], config)
+                            if not correct:
+                                raise RuntimeError(
+                                    path + ": Incorrect page %d" % p)
+                            out.seek(config.block_size * p)
+                            out.write(buf)
+                    if file_size(full_path) > config.input_file_list[path]:
+                        with open(full_path, 'r+') as f:
+                            f.truncate(config.input_file_list[path])
+            else:
+                inp.seek(0)
+                with open(os.path.join(config.pgdata, path), 'wb') as out:
+                    while True:
+                        buf = inp.read(config.block_size)
+                        if len(buf) == 0:
+                            break
+                        else:
+                            out.write(buf)
+        os.unlink(tmp)
+        fd = os.open(full_path, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+        return path
+    except Exception:
+        for l in traceback.format_exc().splitlines():
+            log.error(l)
+
+
+def parse_page(header, config):
+    invalid_lsn = 0
+    layout_version = 4
+    header_size = 24
+    valid_flags = 7
+
+    u, l, csum, flags, lower, upper, spec, version, pxid = \
+        struct.unpack(b'=LL6HL', header)
+
+    lsn = (u << 32) + l
+
+    correct = True
+
+    if flags & valid_flags != flags or \
+            lower < header_size or \
+            lower > upper or \
+            upper > spec or \
+            spec > config.block_size or \
+            lsn == invalid_lsn or \
+            version != config.block_size + layout_version:
+        correct = False
+
+    return correct, lsn
+
+
+def backup_file(path, config):
+    try:
+        fallback = False
+        tmp = os.path.join(config.tmpdir, path)
+        full_path = os.path.join(config.pgdata, path)
+        mkdir(os.path.dirname(tmp))
+
+        file_s = file_size(full_path)
+        orig_s = config.input_file_list[path] if config.lsn is not None else 0
+
+        if config.lsn is not None and file_s == orig_s and \
+                os.path.getmtime(full_path) < config.last_ts:
+            with get_compression_opener(config)(tmp, 'wb') as out:
+                out.write(msgpack.packb([config.magic]))
+        else:
+            with open(full_path, 'rb') as inp:
+                if config.lsn is None:
+                    with get_compression_opener(config)(tmp, 'wb') as out:
+                        while True:
+                            buf = inp.read(config.block_size)
+                            if len(buf) == 0:
+                                break
+                            else:
+                                out.write(buf)
+                else:
+                    pages = []
+                    num = 0
+                    while True:
+                        buf = inp.read(config.block_size)
+                        if len(buf) == 0:
+                            break
+                        elif len(buf) != config.block_size:
+                            log.info(path + ': fallback to full ' +
+                                     '(incorrect page length)')
+                            fallback = True
+                            break
+
+                        correct, flsn = parse_page(buf[:24], config)
+
+                        if not correct:
+                            log.info(path + ': fallback to full' +
+                                     ' (incorrect page: %d)' % num)
+                            fallback = True
+                            break
+
+                        if flsn >= config.lsn:
+                            pages.append(num)
+                            log.debug(path + ': %d page changed' % num)
+                        num += 1
+                    if not fallback:
+                        with get_compression_opener(config)(tmp, 'wb') as out:
+                            out.write(msgpack.packb([config.magic] + pages))
+                            for p in pages:
+                                inp.seek(config.block_size * p)
+                                buf = inp.read(config.block_size)
+                                out.write(buf)
+        if fallback:
+            return backup_file(path, config._replace(lsn=None))
+        else:
+            fd = os.open(tmp, os.O_RDONLY)
+            os.fsync(fd)
+            os.close(fd)
+            rsync_call(os.path.join(os.path.join(config.tmpdir, './'), path),
+                       config.backup_path,
+                       config._replace(rsync_args='-R ' + config.rsync_args))
+            os.unlink(tmp)
+            return path, True
+    except Exception:
+        for l in traceback.format_exc().splitlines():
+            log.error(l)
+        return path, False
+
+
+def backup_dir(path, config):
+    try:
+        rsync_call(os.path.join(os.path.join(config.pgdata, './'), path),
+                   config.backup_path,
+                   config._replace(rsync_args='-Rd ' + config.rsync_args))
+        return path + '/', True
+    except Exception:
+        for l in traceback.format_exc().splitlines():
+            log.error(l)
+        return path + '/', False
+
+
+def backup_data_dir(data_dir, pool, config):
+    flist = {}
+    res = []
+
+    for root, dirs, files in os.walk(data_dir):
+        for d in dirs:
+            path = os.path.relpath(os.path.join(root, d),
+                                   config.pgdata)
+            skip = False
+
+            if path + '/' in config.processed_file_list:
+                skip = True
+
+            for exclude in config.exclude_list:
+                if fnmatch.fnmatch(path, exclude):
+                    skip = True
+                    break
+
+            if not skip:
+                r = pool.apply_async(backup_dir, (path, config))
+                res.append(r)
+        for f in files:
+            path = os.path.relpath(os.path.join(root, f),
+                                   config.pgdata)
+            skip = False
+            for exclude in config.exclude_list:
+                if fnmatch.fnmatch(path, exclude):
+                    skip = True
+                    break
+
+            if path in config.processed_file_list:
+                skip = True
+
+            if skip:
+                continue
+
+            if path.endswith('.conf'):
+                r = pool.apply_async(backup_file,
+                                     (path,
+                                      config._replace(lsn=None,
+                                                      compress='none')))
+            elif path in config.input_file_list:
+                r = pool.apply_async(backup_file,
+                                     (path, config))
+            else:
+                r = pool.apply_async(backup_file,
+                                     (path,
+                                      config._replace(lsn=None)))
+            res.append(r)
+    for r in res:
+        f, s = r.get()
+        path = os.path.join(data_dir, f)
+        if not s:
+            if os.path.exists(path):
+                if os.path.getctime(path) < config.start_time:
+                    log.error('%s: Fatal error. Exiting' % f)
+                    sys.exit(1)
+                else:
+                    log.info('%s: Should appear on wal apply' % f)
+        else:
+            sz = file_size(path)
+            if sz >= 0:
+                flist[f] = sz
+            else:
+                log.info('%s: Seems to be deleted during backup' % f)
+
+    return flist
+
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("action",
+                    type=str,
+                    default="backup")
+
+parser.add_argument("-D", "--pgdata",
+                    type=str,
+                    default="/var/lib/pgsql/data")
+
+parser.add_argument("-i", "--include_files",
+                    type=str, default="")
+
+parser.add_argument("-b", "--backup_path",
+                    nargs=1,
+                    type=str)
+
+parser.add_argument("-l", "--lsn",
+                    type=str)
+
+parser.add_argument("-a", "--after",
+                    type=int,
+                    help="Check only files changed after timestamp (unixtime)")
+
+parser.add_argument("-c", "--compress",
+                    type=str, default="none")
+
+parser.add_argument("-t", "--tmpdir",
+                    type=str,
+                    default="/tmp/barman")
+
+parser.add_argument("-R", "--rsync_args",
+                    type=str, default=" -v")
+
+parser.add_argument("-e", "--exclude",
+                    type=str,
+                    default="*pg_xlog/*,*pg_log/*,*pg_stat_tmp/*," +
+                            "*pg_replslot/*")
+
+parser.add_argument("-r", "--rsync_retries",
+                    type=int, default=5)
+
+parser.add_argument("-s", "--retries_pause",
+                    type=int, default=30)
+
+parser.add_argument("-f", "--file_list",
+                    type=str)
+
+parser.add_argument("-p", "--parallel",
+                    type=int, default=1)
+
+parser.add_argument("-T", "--tablespaces",
+                    type=str, default="")
+
+parser.add_argument("-Z", "--block_size",
+                    type=int, default=8192)
+
+parser.add_argument("-m", "--magic_number",
+                    type=int, default=2359285)
+
+parser.add_argument("-w", "--bandwidth_limit",
+                    type=int)
+
+parser.add_argument("-W", "--tablespaces_bandwidth_limit",
+                    type=str, default="")
+
+parser.add_argument("-v", "--verbosity", action="count", default=0,
+                    help="increase output verbosity")
+
+args = parser.parse_args()
+
+logging.basicConfig(level=max(logging.DEBUG,
+                              logging.ERROR - 10 * args.verbosity),
+                    format='%(asctime)s [%(levelname)s] %(name)s:\t' +
+                           '%(message)s')
+
+log = logging.getLogger(args.action)
+
+pool = Pool(processes=args.parallel)
+
+tablespaces_bw_limits = {}
+for i in args.tablespaces_bandwidth_limit.split(','):
+    if ':' in i:
+        tablespaces_bw_limits[i.split(':')[0]] = int(i.split(':')[1])
+
+tablespaces = {}
+for i in args.tablespaces.split(','):
+    if ':' in i:
+        tablespaces[i.split(':')[0]] = i.split(':')[1]
+
+if args.bandwidth_limit:
+    rsync_args = args.rsync_args.lstrip() + \
+        ' --bwlimit=%d' % max(args.bandwidth_limit / args.parallel, 1)
+else:
+    rsync_args = args.rsync_args.lstrip()
+
+config = Config(block_size=args.block_size,
+                magic=args.magic_number,
+                pgdata=args.pgdata,
+                lsn=int(args.lsn) if args.lsn else None,
+                last_ts=args.after,
+                backup_path=args.backup_path[0],
+                exclude_list=args.exclude.split(','),
+                input_file_list={},
+                start_time=time.time(),
+                processed_file_list={},
+                tmpdir=args.tmpdir,
+                compress=args.compress,
+                rsync_args=rsync_args[:],
+                rsync_retries=args.rsync_retries,
+                retries_pause=args.retries_pause)
+
+tablespaces_root = os.path.join(config.pgdata, 'pg_tblspc')
+
+if args.action == 'backup':
+    if args.file_list is None and config.lsn is not None:
+        log.error("Unable to start incremental backup without file list")
+        sys.exit(1)
+
+    if config.lsn is not None:
+        mkdir(config.tmpdir)
+        rsync_call(args.file_list,
+                   os.path.join(config.tmpdir, 'file.list'),
+                   config)
+        with open(os.path.join(config.tmpdir, 'file.list')) as f:
+            for line in f:
+                name, size = line.split('|')
+                config.input_file_list[name] = int(size)
+
+    for l in tablespaces:
+        path = os.path.join(tablespaces_root, l)
+        if os.path.islink(path) and os.readlink(path) == tablespaces[l]:
+            if tablespaces[l].startswith(config.pgdata):
+                path = tablespaces[l]
+
+            if l in tablespaces_bw_limits:
+                rsync_args = args.rsync_args.lstrip() + ' --bwlimit=' + \
+                    '%d' % max(tablespaces_bw_limits[l] / args.parallel, 1)
+
+                completed = backup_data_dir(path, pool, config._replace(
+                    rsync_args=rsync_args))
+            else:
+                config.processed_file_list.update(
+                    backup_data_dir(path, pool, config))
+        else:
+            log.error("Unable to handle tablespace %s: %s" % (l,
+                                                              tablespaces[l]))
+
+    config.processed_file_list.update(
+        backup_data_dir(config.pgdata, pool, config))
+
+    completed = {}
+    for f in args.include_files.split(','):
+        if f:
+            d, n = os.path.split(f)
+            if backup_file(n, config._replace(pgdata=d,
+                                              compress='none')) is None:
+                log.error('Fatal error. Exiting')
+                sys.exit(1)
+            else:
+                completed[n] = file_size(f)
+
+    config.processed_file_list.update(completed)
+
+    _, s = backup_file('global/pg_control', config._replace(lsn=None))
+
+    if not s:
+        log.error('Unable to backup pg_control file. This is fatal.')
+        sys.exit(1)
+
+    with open(os.path.join(config.tmpdir, 'file.list'), 'w') as f:
+        for i in config.processed_file_list:
+            f.write('%s|%d\n' % (i, config.processed_file_list[i]))
+
+    rsync_call(os.path.join(os.path.join(config.tmpdir, './'), 'file.list'),
+               config.backup_path,
+               config._replace(rsync_args='-R ' + config.rsync_args))
+
+    os.unlink(os.path.join(config.tmpdir, 'file.list'))
+
+    shutil.rmtree(config.tmpdir)
+elif args.action == 'restore':
+    mkdir(config.tmpdir)
+
+    mkdir(tablespaces_root)
+
+    pgdata_tablespaces = []
+
+    for l in tablespaces:
+        path = os.path.join(tablespaces_root, l)
+        mkdir(tablespaces[l])
+        if os.path.islink(path) and l in tablespaces:
+            if os.readlink(path) != tablespaces[l]:
+                os.unlink(path)
+                os.symlink(tablespaces[l], path)
+        else:
+            os.symlink(tablespaces[l], path)
+        if tablespaces[l].startswith(config.pgdata):
+            pgdata_tablespaces.append(tablespaces[l])
+
+    for l in os.listdir(tablespaces_root):
+        path = os.path.join(tablespaces_root, l)
+        if os.path.islink(path) and l not in tablespaces:
+            os.unlink(path)
+
+    rsync_call(os.path.join(config.backup_path, 'file.list'),
+               os.path.join(config.tmpdir, 'file.list'),
+               config)
+
+    with open(os.path.join(config.tmpdir, 'file.list')) as f:
+        for line in f:
+            name, size = line.split('|')
+            config.input_file_list[name] = int(size)
+
+    os.unlink(os.path.join(config.tmpdir, 'file.list'))
+
+    res = []
+
+    for f in [x for x in config.input_file_list if not x.endswith('/')]:
+        if f.endswith('.conf'):
+            res.append(pool.apply_async(
+                restore_file, (f, config._replace(compress='none'))))
+        else:
+            res.append(pool.apply_async(restore_file, (f, config)))
+
+    for r in res:
+        f = r.get()
+        if f is None:
+            log.error('Fatal error. Exiting')
+            sys.exit(1)
+
+    for d in [x for x in config.input_file_list if x.endswith('/')]:
+        path = os.path.join(config.pgdata, d)
+        mkdir(os.path.join(config.pgdata, d))
+
+    for root, dirs, files in os.walk(config.pgdata):
+        for d in dirs:
+            path = os.path.relpath(os.path.join(root, d),
+                                   config.pgdata)
+            skip = False
+            for t in pgdata_tablespaces:
+                if path.startswith(t):
+                    skip = True
+            if not path + '/' in config.input_file_list and not skip:
+                shutil.rmtree(os.path.join(root, d))
+        for f in files:
+            path = os.path.relpath(os.path.join(root, f),
+                                   config.pgdata)
+            skip = False
+            for t in pgdata_tablespaces:
+                if path.startswith(t):
+                    skip = True
+            if path not in config.input_file_list and not skip:
+                os.unlink(os.path.join(root, f))
+
+    if not os.path.exists(os.path.join(config.pgdata, 'backup_label')):
+        try:
+            rsync_call(os.path.join(config.backup_path, 'backup_label'),
+                       os.path.join(config.pgdata, 'backup_label'),
+                       config)
+        except Exception:
+            log.error("Unable to transfer backup_label file.")
+            sys.exit(1)
+
+    shutil.rmtree(config.tmpdir)
+else:
+    log.error('Unknown action')
+    sys.exit(1)

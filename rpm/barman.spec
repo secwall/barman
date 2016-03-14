@@ -44,6 +44,15 @@ Vendor:		2ndQuadrant Italia Srl <info@2ndquadrant.it>
 Requires:	python-abi = %{pybasever}, %{__python_ver}-psycopg2 >= 2.4.2, %{__python_ver}-argh >= 0.21.2, %{__python_ver}-argcomplete, %{__python_ver}-dateutil
 Requires:	/usr/sbin/useradd
 Requires:	rsync >= 3.0.4
+Requires:	barman-incr >= %{main_version}
+
+%package incr
+Summary:	Helper for incremental backup with barman
+Requires:	python-abi = %{pybasever}, %{__python_ver}-backports-lzma, %{__python_ver}-msgpack >= 0.4.6
+%if 0%{?rhel} == 5
+Requires:	%{__python_ver}-argparse
+%endif
+Requires:	rsync >= 3.0.4
 
 %description
 Barman (Backup and Recovery Manager) is an open-source
@@ -55,6 +64,10 @@ reduce risk and help DBAs during the recovery phase.
 
 Barman is distributed under GNU GPL 3 and maintained
 by 2ndQuadrant.
+
+%description incr
+Barman-incr is simple python tool for incremental backup of PostgreSQL (>= 9.3).
+
 
 %prep
 %setup -n barman-%{version}%{?extra_version:%{extra_version}} -q
@@ -87,6 +100,8 @@ install -pm 644 scripts/barman.bash_completion %{buildroot}%{_sysconfdir}/bash_c
 install -pm 644 barman.cron %{buildroot}%{_sysconfdir}/cron.d/barman
 install -pm 644 barman.logrotate %{buildroot}%{_sysconfdir}/logrotate.d/barman
 touch %{buildroot}/var/log/barman/barman.log
+mkdir -p %{buildroot}/usr/bin
+install -pm 755 bin/barman-incr %{buildroot}/usr/bin/barman-incr
 
 %clean
 rm -rf %{buildroot}
@@ -107,6 +122,9 @@ rm -rf %{buildroot}
 %attr(700,barman,barman) %dir /var/lib/%{name}
 %attr(755,barman,barman) %dir /var/log/%{name}
 %attr(600,barman,barman) %ghost /var/log/%{name}/%{name}.log
+
+%files incr
+%attr(755,root,root) /usr/bin/barman-incr
 
 %pre
 groupadd -f -r barman >/dev/null 2>&1 || :

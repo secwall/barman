@@ -43,7 +43,7 @@ class TestRecoveryExecutor(object):
 
         # Test
         backup_manager = testing_helpers.build_backup_manager()
-        assert RecoveryExecutor(backup_manager)
+        assert RecoveryExecutor.factory(backup_manager)
 
     def test_analyse_temporary_config_files(self, tmpdir):
         """
@@ -73,7 +73,7 @@ class TestRecoveryExecutor(object):
         # Build a RecoveryExecutor object (using a mock as server and backup
         # manager.
         backup_manager = testing_helpers.build_backup_manager()
-        executor = RecoveryExecutor(backup_manager)
+        executor = RecoveryExecutor.factory(backup_manager)
         # Identify dangerous options into config files for remote recovery
         executor._analyse_temporary_config_files(recovery_info)
         assert len(recovery_info['results']['changes']) == 2
@@ -112,7 +112,7 @@ class TestRecoveryExecutor(object):
         # Build a RecoveryExecutor object (using a mock as server and backup
         # manager.
         backup_manager = testing_helpers.build_backup_manager()
-        executor = RecoveryExecutor(backup_manager)
+        executor = RecoveryExecutor.factory(backup_manager)
         executor._map_temporary_config_files(recovery_info,
                                              backup_info, 'ssh@something')
         # check that configuration files have been moved by the method
@@ -132,7 +132,7 @@ class TestRecoveryExecutor(object):
         """
         backup_info = testing_helpers.build_test_backup_info()
         backup_manager = testing_helpers.build_backup_manager()
-        executor = RecoveryExecutor(backup_manager)
+        executor = RecoveryExecutor.factory(backup_manager)
         backup_info.version = 90300
 
         # setup should create a temporary directory
@@ -177,7 +177,7 @@ class TestRecoveryExecutor(object):
         backup_info = testing_helpers.build_test_backup_info()
         backup_manager = testing_helpers.build_backup_manager()
         # Build a recovery executor
-        executor = RecoveryExecutor(backup_manager)
+        executor = RecoveryExecutor.factory(backup_manager)
         executor._set_pitr_targets(recovery_info, backup_info,
                                    dest.strpath,
                                    '', '', '', '')
@@ -217,7 +217,7 @@ class TestRecoveryExecutor(object):
         dest = tmpdir.mkdir('destination')
         # Build a recovery executor using a real server
         server = testing_helpers.build_real_server()
-        executor = RecoveryExecutor(server.backup_manager)
+        executor = RecoveryExecutor.factory(server.backup_manager)
         executor._generate_recovery_conf(recovery_info, backup_info,
                                          dest.strpath,
                                          True, 'remote@command',
@@ -256,7 +256,7 @@ class TestRecoveryExecutor(object):
             server=server,
             tablespaces=[('tbs1', 16387, '/fake/location')])
         # Build a executor
-        executor = RecoveryExecutor(server.backup_manager)
+        executor = RecoveryExecutor.factory(server.backup_manager)
         executor.config.tablespace_bandwidth_limit = {'tbs1': ''}
         executor.config.bandwidth_limit = 10
 
@@ -323,7 +323,7 @@ class TestRecoveryExecutor(object):
         c['gzip'].decompress.side_effect = lambda src, dst: open(dst, 'w')
         c['bzip2'].decompress.side_effect = lambda src, dst: open(dst, 'w')
         # Build executor
-        executor = RecoveryExecutor(server.backup_manager)
+        executor = RecoveryExecutor.factory(server.backup_manager)
 
         # Test: local copy
         required_wals = (
@@ -382,7 +382,7 @@ class TestRecoveryExecutor(object):
         # build an executor
         server = testing_helpers.build_real_server(
             main_conf={'wals_directory': wals.strpath})
-        executor = RecoveryExecutor(server.backup_manager)
+        executor = RecoveryExecutor.factory(server.backup_manager)
         # use a mock as cmd obj
         cmd_mock = mock.Mock()
         executor._prepare_tablespaces(backup_info, cmd_mock, dest.strpath, {})
@@ -433,7 +433,7 @@ class TestRecoveryExecutor(object):
             main_conf={
                 "wals_directory": wals.strpath
             })
-        executor = RecoveryExecutor(server.backup_manager)
+        executor = RecoveryExecutor.factory(server.backup_manager)
         # test local recovery
         rec_info = executor.recover(backup_info, dest.strpath, None, None,
                                     None, None, None, True, None)

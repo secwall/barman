@@ -183,6 +183,8 @@ def backup_completer(prefix, parsed_args, **kwargs):
      type=check_non_negative)
 @arg('--no-retry', help='Disable base backup copy retry logic.',
      dest='retry_times', action='store_const', const=0)
+@arg('--full', help='Force full backup (only for copy method incr',
+     dest='force_full', action='store_true')
 @expects_obj
 def backup(args):
     """
@@ -202,6 +204,8 @@ def backup(args):
             server.config.basebackup_retry_sleep = args.retry_sleep
         if args.retry_times is not None:
             server.config.basebackup_retry_times = args.retry_times
+        if args.force_full:
+            server.config.incr_max_increments = 0
         if hasattr(args, 'immediate_checkpoint'):
             server.config.immediate_checkpoint = args.immediate_checkpoint
         with closing(server):

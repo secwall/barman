@@ -530,6 +530,18 @@ Following variables are specific to archive scripts:
 - `BARMAN_TIMESTAMP`: WAL file timestamp
 - `BARMAN_COMPRESSION`: type of compression used for the WAL file
 
+## Page-level incremental backups
+
+> **Warning**
+> This is experimental feature
+
+Agent (`barman-incr`) on database host is required to take backup.
+Page-level incremental backups uses quite simple idea: all datafile page
+headers have `lsn` field which refers to last transaction that modified
+this page. Agent reads every page in every datafile (if it is unable to
+parse page whole file will be taken into backup).
+To enable this feature set `backup_method = incr` in barman.conf.
+Refer to `man 5 barman` for more detailed configuration instructions.
 
 ## Customization
 

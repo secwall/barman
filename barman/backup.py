@@ -29,7 +29,7 @@ import dateutil.parser
 import dateutil.tz
 
 from barman import output, xlog
-from barman.backup_executor import PostgresBackupExecutor, RsyncBackupExecutor
+from barman.backup_executor import BackupExecutor
 from barman.compression import CompressionManager
 from barman.config import BackupOptions
 from barman.exceptions import (AbortedRetryHookScript,
@@ -60,10 +60,7 @@ class BackupManager(RemoteStatusMixin):
         self.compression_manager = CompressionManager(self.config, server.path)
         self.executor = None
         try:
-            if self.config.backup_method == "postgres":
-                self.executor = PostgresBackupExecutor(self)
-            else:
-                self.executor = RsyncBackupExecutor(self)
+            self.executor = BackupExecutor.factory(self)
         except SshCommandException as e:
             self.config.disabled = True
             self.config.msg_list.append(str(e).strip())
@@ -183,6 +180,69 @@ class BackupManager(RemoteStatusMixin):
             raise UnknownBackupIdException('Could not find backup_id %s' %
                                            backup_id)
 
+    def get_restore_path(self, backup_id, status_filter=DEFAULT_STATUS_FILTER):
+        """
+        Get the list of backup ids required to restore backup_id
+
+        :param status_filter: default DEFAULT_STATUS_FILTER. The status of
+            the backups returned
+        """
+        if not isinstance(status_filter, tuple):
+            status_filter = tuple(status_filter)
+        backup = BackupInfo(self.server, backup_id=backup_id)
+        if backup.incr_lsn is None:
+            return [backup_id]
+        else:
+            available_backups = self.get_available_backups(status_filter +
+                                                           (backup.status,))
+            ids = list(reversed(sorted(available_backups.keys())))
+            ret = []
+            expected_lsn = backup.incr_lsn
+            try:
+                current = ids.index(backup_id)
+                while current < len(ids) - 1:
+                    res = available_backups[ids[current + 1]]
+                    if res.status in status_filter:
+                        if res.begin_xlog == expected_lsn:
+                            ret.append(res.backup_id)
+                            if res.incr_lsn is None:
+                                return list(reversed(ret)) + [backup_id]
+                            else:
+                                expected_lsn = res.incr_lsn
+                    current += 1
+                return []
+            except ValueError:
+                raise RuntimeError('Could not build path for %s' % backup_id)
+
+    def get_increments(self, backup_id, status_filter=DEFAULT_STATUS_FILTER):
+        """
+        Get the list of backup ids that require this backup id for restore
+
+        :param status_filter: default DEFAULT_STATUS_FILTER. The status of
+            the backups returned
+        """
+        if not isinstance(status_filter, tuple):
+            status_filter = tuple(status_filter)
+        backup = BackupInfo(self.server, backup_id=backup_id)
+        available_backups = self.get_available_backups(status_filter +
+                                                       (backup.status,))
+        ids = list(sorted(available_backups.keys()))
+        ret = []
+        expected_lsns = [backup.begin_xlog]
+        try:
+            current = ids.index(backup_id)
+            while current < len(ids) - 1:
+                res = available_backups[ids[current + 1]]
+                if res.status in status_filter:
+                    if res.incr_lsn is not None and \
+                            res.incr_lsn in expected_lsns:
+                        ret.append(ids[current + 1])
+                        expected_lsns.append(res.begin_xlog)
+                current += 1
+            return ret
+        except ValueError:
+            raise RuntimeError('Could not find increments for %s' % backup_id)
+
     def get_next_backup(self, backup_id, status_filter=DEFAULT_STATUS_FILTER):
         """
         Get the next backup (if any) in the catalog
@@ -248,7 +308,10 @@ class BackupManager(RemoteStatusMixin):
         minimum_redundancy = self.server.config.minimum_redundancy
         # Honour minimum required redundancy
         if backup.status == BackupInfo.DONE and \
-                minimum_redundancy >= len(available_backups):
+                self.server.config.minimum_redundancy >= \
+                min(len(available_backups),
+                    len(available_backups) -
+                    len(self.get_increments(backup.backup_id))):
             output.warning("Skipping delete of backup %s for server %s "
                            "due to minimum redundancy requirements "
                            "(minimum redundancy = %s, "
@@ -258,71 +321,79 @@ class BackupManager(RemoteStatusMixin):
                            len(available_backups),
                            minimum_redundancy)
             return
-        # Keep track of when the delete operation started.
-        delete_start_time = datetime.datetime.now()
-        output.info("Deleting backup %s for server %s",
-                    backup.backup_id, self.config.name)
-        previous_backup = self.get_previous_backup(backup.backup_id)
-        next_backup = self.get_next_backup(backup.backup_id)
-        # Delete all the data contained in the backup
-        try:
-            self.delete_backup_data(backup)
-        except OSError as e:
-            output.error("Failure deleting backup %s for server %s.\n%s",
-                         backup.backup_id, self.config.name, e)
-            return
-        # Check if we are deleting the first available backup
-        if not previous_backup:
-            # In the case of exclusive backup (default), removes any WAL
-            # files associated to the backup being deleted.
-            # In the case of concurrent backup, removes only WAL files
-            # prior to the start of the backup being deleted, as they
-            # might be useful to any concurrent backup started immediately
-            # after.
-            remove_until = None  # means to remove all WAL files
-            if next_backup:
-                remove_until = next_backup
-            elif BackupOptions.CONCURRENT_BACKUP in self.config.backup_options:
-                remove_until = backup
 
-            timelines_to_protect = set()
-            # If remove_until is not set there are no backup left
-            if remove_until:
-                # Retrieve the list of extra timelines that contains at least
-                # a backup. On such timelines we don't want to delete any WAL
-                for value in self.get_available_backups(
-                        BackupInfo.STATUS_ARCHIVING).values():
-                    # Ignore the backup that is being deleted
-                    if value == backup:
-                        continue
-                    timelines_to_protect.add(value.timeline)
-                # Remove the timeline of `remove_until` from the list.
-                # We have enough information to safely delete unused WAL files
-                # on it.
-                timelines_to_protect -= set([remove_until.timeline])
+        rm_list = [backup] + list(map(self.get_backup,
+                                      self.get_increments(backup.backup_id)))
 
-            output.info("Delete associated WAL segments:")
-            for name in self.remove_wal_before_backup(remove_until,
+        for b in rm_list:
+            # Keep track of when the delete operation started.
+            delete_start_time = datetime.datetime.now()
+            output.info("Deleting backup %s for server %s",
+                        b.backup_id, self.config.name)
+            previous_backup = self.get_previous_backup(b.backup_id)
+            next_backup = self.get_next_backup(b.backup_id)
+            # Delete all the data contained in the backup
+            try:
+                self.delete_backup_data(b)
+            except OSError as e:
+                output.error("Failure deleting backup %s for server %s.\n%s",
+                             b.backup_id, self.config.name, e)
+                return
+            # Check if we are deleting the first available backup
+            if not previous_backup:
+                # In the case of exclusive backup (default), removes any WAL
+                # files associated to the backup being deleted.
+                # In the case of concurrent backup, removes only WAL files
+                # prior to the start of the backup being deleted, as they
+                # might be useful to any concurrent backup started immediately
+                # after.
+                remove_until = None  # means to remove all WAL files
+                if next_backup:
+                    remove_until = next_backup
+                elif BackupOptions.CONCURRENT_BACKUP in \
+                        self.config.backup_options:
+                    remove_until = b
+
+                timelines_to_protect = set()
+                # If remove_until is not set there are no backup left
+                if remove_until:
+                    # Retrieve the list of extra timelines
+                    # that contains at least a backup.
+                    # On such timelines we don't want to delete any WAL
+                    for value in self.get_available_backups(
+                            BackupInfo.STATUS_ARCHIVING).values():
+                        # Ignore the backup that is being deleted
+                        if value == b:
+                            continue
+                        timelines_to_protect.add(value.timeline)
+                    # Remove the timeline of `remove_until` from the list.
+                    # We have enough information to safely delete unused
+                    # WAL files on it.
+                    timelines_to_protect -= set([remove_until.timeline])
+
+                output.info("Delete associated WAL segments:")
+                for name in \
+                        self.remove_wal_before_backup(remove_until,
                                                       timelines_to_protect):
-                output.info("\t%s", name)
-        # As last action, remove the backup directory,
-        # ending the delete operation
-        try:
-            self.delete_basebackup(backup)
-        except OSError as e:
-            output.error("Failure deleting backup %s for server %s.\n%s\n"
-                         "Please manually remove the '%s' directory",
-                         backup.backup_id, self.config.name, e,
-                         backup.get_basebackup_directory())
-            return
-        self.backup_cache_remove(backup)
-        # Save the time of the complete removal of the backup
-        delete_end_time = datetime.datetime.now()
-        output.info("Deleted backup %s (start time: %s, elapsed time: %s)",
-                    backup.backup_id,
-                    delete_start_time.ctime(),
-                    human_readable_timedelta(
-                        delete_end_time - delete_start_time))
+                    output.info("\t%s", name)
+            # As last action, remove the backup directory,
+            # ending the delete operation
+            try:
+                self.delete_basebackup(backup)
+            except OSError as e:
+                output.error("Failure deleting backup %s for server %s.\n%s\n"
+                             "Please manually remove the '%s' directory",
+                             backup.backup_id, self.config.name, e,
+                             backup.get_basebackup_directory())
+                return
+            self.backup_cache_remove(backup)
+            # Save the time of the complete removal of the backup
+            delete_end_time = datetime.datetime.now()
+            output.info("Deleted backup %s (start time: %s, elapsed time: %s)",
+                        backup.backup_id,
+                        delete_start_time.ctime(),
+                        human_readable_timedelta(
+                            delete_end_time - delete_start_time))
 
     def backup(self):
         """
@@ -444,7 +515,7 @@ class BackupManager(RemoteStatusMixin):
         # Archive every WAL files in the incoming directory of the server
         self.server.archive_wal(verbose=False)
         # Delegate the recovery operation to a RecoveryExecutor object
-        executor = RecoveryExecutor(self)
+        executor = RecoveryExecutor.factory(self)
         recovery_info = executor.recover(backup_info,
                                          dest, tablespaces,
                                          target_tli, target_time,

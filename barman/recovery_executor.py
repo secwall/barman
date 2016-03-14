@@ -29,6 +29,7 @@ import shutil
 import socket
 import tempfile
 import time
+from abc import ABCMeta, abstractmethod
 from io import StringIO
 
 import dateutil.parser
@@ -72,6 +73,8 @@ class RecoveryExecutor(object):
     # List of options that, if present, need to be forced to a specific value
     # during recovery, to avoid data losses
     MANGLE_OPTIONS = {'archive_command': 'false'}
+
+    __metaclass__ = ABCMeta
 
     def __init__(self, backup_manager):
         """
@@ -371,6 +374,7 @@ class RecoveryExecutor(object):
         recovery_info['target_epoch'] = target_epoch
         recovery_info['target_datetime'] = target_datetime
 
+    @abstractmethod
     def _retrieve_safe_horizon(self, recovery_info, backup_info, dest):
         """
         Retrieve the safe_horizon for smart copy
@@ -385,40 +389,8 @@ class RecoveryExecutor(object):
         :param barman.infofile.BackupInfo backup_info: a backup representation
         :param str dest: recovery destination directory
         """
-        # noinspection PyBroadException
-        try:
-            backup_begin_time = backup_info.begin_time
-            # Retrieve previously recovered backup metadata (if available)
-            dest_info_txt = recovery_info['cmd'].get_file_content(
-                os.path.join(dest, '.barman-recover.info'))
-            dest_info = BackupInfo(
-                self.server,
-                info_file=StringIO(dest_info_txt))
-            dest_begin_time = dest_info.begin_time
-            # Pick the earlier begin time. Both are tz-aware timestamps because
-            # BackupInfo class ensure it
-            safe_horizon = min(backup_begin_time, dest_begin_time)
-            output.info("Using safe horizon time for smart rsync copy: %s",
-                        safe_horizon)
-        except FsOperationFailed as e:
-            # Setting safe_horizon to None will effectively disable
-            # the time-based part of smart_copy method. However it is still
-            # faster than running all the transfers with checksum enabled.
-            #
-            # FsOperationFailed means the .barman-recover.info is not available
-            # on destination directory
-            safe_horizon = None
-            _logger.warning('Unable to retrieve safe horizon time '
-                            'for smart rsync copy: %s', e)
-        except Exception as e:
-            # Same as above, but something failed decoding .barman-recover.info
-            # or comparing times, so log the full traceback
-            safe_horizon = None
-            _logger.exception('Error retrieving safe horizon time '
-                              'for smart rsync copy: %s', e)
 
-        recovery_info['safe_horizon'] = safe_horizon
-
+    @abstractmethod
     def _prepare_tablespaces(self, backup_info, cmd, dest, tablespaces):
         """
         Prepare the directory structure for required tablespaces,
@@ -430,46 +402,8 @@ class RecoveryExecutor(object):
         :param str dest: destination dir for the recovery
         :param dict tablespaces: dict of all the tablespaces and their location
         """
-        tblspc_dir = os.path.join(dest, 'pg_tblspc')
-        try:
-            # check for pg_tblspc dir into recovery destination folder.
-            # if it does not exists, create it
-            cmd.create_dir_if_not_exists(tblspc_dir)
-        except FsOperationFailed as e:
-            output.error("unable to initialise tablespace directory "
-                         "'%s': %s", tblspc_dir, e)
-            output.close_and_exit()
-        for item in backup_info.tablespaces:
 
-            # build the filename of the link under pg_tblspc directory
-            pg_tblspc_file = os.path.join(tblspc_dir, str(item.oid))
-
-            # by default a tablespace goes in the same location where
-            # it was on the source server when the backup was taken
-            location = item.location
-
-            # if a relocation has been requested for this tablespace,
-            # use the target directory provided by the user
-            if tablespaces and item.name in tablespaces:
-                location = tablespaces[item.name]
-
-            try:
-                # remove the current link in pg_tblspc, if it exists
-                cmd.delete_if_exists(pg_tblspc_file)
-                # create tablespace location, if does not exist
-                # (raise an exception if it is not possible)
-                cmd.create_dir_if_not_exists(location)
-                # check for write permissions on destination directory
-                cmd.check_write_permission(location)
-                # create symlink between tablespace and recovery folder
-                cmd.create_symbolic_link(location, pg_tblspc_file)
-            except FsOperationFailed as e:
-                output.error("unable to prepare '%s' tablespace "
-                             "(destination '%s'): %s",
-                             item.name, location, e)
-                output.close_and_exit()
-            output.info("\t%s, %s, %s", item.oid, item.name, location)
-
+    @abstractmethod
     def _backup_copy(self, backup_info, dest, tablespaces=None,
                      remote_command=None, safe_horizon=None):
         """
@@ -491,85 +425,6 @@ class RecoveryExecutor(object):
         :param datetime.datetime|None safe_horizon: anything after this time
             has to be checked with checksum
         """
-
-        # Set a ':' prefix to remote destinations
-        dest_prefix = ''
-        if remote_command:
-            dest_prefix = ':'
-
-        # Create the copy controller object, specific for rsync,
-        # which will drive all the copy operations. Items to be
-        # copied are added before executing the copy() method
-        controller = RsyncCopyController(
-            path=self.server.path,
-            ssh_command=remote_command,
-            network_compression=self.config.network_compression,
-            safe_horizon=safe_horizon,
-            retry_times=self.config.basebackup_retry_times,
-            retry_sleep=self.config.basebackup_retry_sleep,
-        )
-
-        # Dictionary for paths to be excluded from rsync
-        exclude_and_protect = []
-
-        # Process every tablespace
-        if backup_info.tablespaces:
-            for tablespace in backup_info.tablespaces:
-                # By default a tablespace goes in the same location where
-                # it was on the source server when the backup was taken
-                location = tablespace.location
-                # If a relocation has been requested for this tablespace
-                # use the user provided target directory
-                if tablespaces and tablespace.name in tablespaces:
-                    location = tablespaces[tablespace.name]
-
-                # If the tablespace location is inside the data directory,
-                # exclude and protect it from being deleted during
-                # the data directory copy
-                if location.startswith(dest):
-                    exclude_and_protect += [location[len(dest):]]
-
-                # Exclude and protect the tablespace from being deleted during
-                # the data directory copy
-                exclude_and_protect.append("/pg_tblspc/%s" % tablespace.oid)
-
-                # Add the tablespace directory to the list of objects
-                # to be copied by the controller
-                controller.add_directory(
-                    label=tablespace.name,
-                    src='%s/' % backup_info.get_data_directory(tablespace.oid),
-                    dst=dest_prefix + location,
-                    bwlimit=self.config.get_bwlimit(tablespace),
-                    item_class=controller.TABLESPACE_CLASS
-                    )
-
-        # Add the PGDATA directory to the list of objects to be copied
-        # by the controller
-        controller.add_directory(
-            label='pgdata',
-            src='%s/' % backup_info.get_data_directory(),
-            dst=dest_prefix + dest,
-            bwlimit=self.config.get_bwlimit(),
-            exclude=[
-                '/pg_xlog/*',
-                '/pg_log/*',
-                '/recovery.conf',
-                '/postmaster.pid'],
-            exclude_and_protect=exclude_and_protect,
-            item_class=controller.PGDATA_CLASS
-        )
-
-        # TODO: Manage different location for configuration files
-        # TODO: that were not within the data directory
-
-        # Execute the copy
-        try:
-            controller.copy()
-        # TODO: Improve the exception output
-        except CommandFailedException as e:
-            msg = "data transfer failure"
-            raise DataTransferFailure.from_command_error(
-                'rsync', e, msg)
 
     def _xlog_copy(self, required_xlog_files, wal_dest, remote_command):
         """
@@ -1008,3 +863,330 @@ class RecoveryExecutor(object):
                             rm.group(2)]))
 
         return clashes
+
+    def factory(manager):
+        """
+        RecoveryExecutor factory
+
+        :param barman.backup.BackupManager backup_manager: the BackupManager
+            owner of the executor
+        """
+        if manager.config.backup_method == 'rsync':
+            return RsyncRecoveryExecutor(manager)
+        elif manager.config.backup_method == 'incr':
+            return IncrementalRecoveryExecutor(manager)
+        assert 0, "Bad backup_method: " + manager.config.backup_method
+
+    factory = staticmethod(factory)
+
+
+class RsyncRecoveryExecutor(RecoveryExecutor):
+    def __init__(self, backup_manager):
+        super(RsyncRecoveryExecutor, self).__init__(backup_manager)
+
+    def _retrieve_safe_horizon(self, recovery_info, backup_info, dest):
+        """
+        Retrieve the safe_horizon for smart copy
+
+        If the target directory contains a previous recovery, it is safe to
+        pick the least of the two backup "begin times" (the one we are
+        recovering now and the one previously recovered in the target
+        directory). Set the value in the given recovery_info dictionary.
+
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
+        :param barman.infofile.BackupInfo backup_info: a backup representation
+        :param str dest: recovery destination directory
+        """
+        # noinspection PyBroadException
+        try:
+            backup_begin_time = backup_info.begin_time
+            # Retrieve previously recovered backup metadata (if available)
+            dest_info_txt = recovery_info['cmd'].get_file_content(
+                os.path.join(dest, '.barman-recover.info'))
+            dest_info = BackupInfo(
+                self.server,
+                info_file=StringIO(dest_info_txt))
+            dest_begin_time = dest_info.begin_time
+            # Pick the earlier begin time. Both are tz-aware timestamps because
+            # BackupInfo class ensure it
+            safe_horizon = min(backup_begin_time, dest_begin_time)
+            output.info("Using safe horizon time for smart rsync copy: %s",
+                        safe_horizon)
+        except FsOperationFailed as e:
+            # Setting safe_horizon to None will effectively disable
+            # the time-based part of smart_copy method. However it is still
+            # faster than running all the transfers with checksum enabled.
+            #
+            # FsOperationFailed means the .barman-recover.info is not available
+            # on destination directory
+            safe_horizon = None
+            _logger.warning('Unable to retrieve safe horizon time '
+                            'for smart rsync copy: %s', e)
+        except Exception as e:
+            # Same as above, but something failed decoding .barman-recover.info
+            # or comparing times, so log the full traceback
+            safe_horizon = None
+            _logger.exception('Error retrieving safe horizon time '
+                              'for smart rsync copy: %s', e)
+
+        recovery_info['safe_horizon'] = safe_horizon
+
+    def _prepare_tablespaces(self, backup_info, cmd, dest, tablespaces):
+        """
+        Prepare the directory structure for required tablespaces,
+        taking care of tablespaces relocation, if requested.
+
+        :param barman.infofile.BackupInfo backup_info: backup representation
+        :param barman.fs.UnixLocalCommand cmd: Object for
+            filesystem interaction
+        :param str dest: destination dir for the recovery
+        :param dict tablespaces: dict of all the tablespaces and their location
+        """
+        tblspc_dir = os.path.join(dest, 'pg_tblspc')
+        try:
+            # check for pg_tblspc dir into recovery destination folder.
+            # if it does not exists, create it
+            cmd.create_dir_if_not_exists(tblspc_dir)
+        except FsOperationFailed as e:
+            output.error("unable to initialise tablespace directory "
+                         "'%s': %s", tblspc_dir, e)
+            output.close_and_exit()
+        for item in backup_info.tablespaces:
+
+            # build the filename of the link under pg_tblspc directory
+            pg_tblspc_file = os.path.join(tblspc_dir, str(item.oid))
+
+            # by default a tablespace goes in the same location where
+            # it was on the source server when the backup was taken
+            location = item.location
+
+            # if a relocation has been requested for this tablespace,
+            # use the target directory provided by the user
+            if tablespaces and item.name in tablespaces:
+                location = tablespaces[item.name]
+
+            try:
+                # remove the current link in pg_tblspc, if it exists
+                cmd.delete_if_exists(pg_tblspc_file)
+                # create tablespace location, if does not exist
+                # (raise an exception if it is not possible)
+                cmd.create_dir_if_not_exists(location)
+                # check for write permissions on destination directory
+                cmd.check_write_permission(location)
+                # create symlink between tablespace and recovery folder
+                cmd.create_symbolic_link(location, pg_tblspc_file)
+            except FsOperationFailed as e:
+                output.error("unable to prepare '%s' tablespace "
+                             "(destination '%s'): %s",
+                             item.name, location, e)
+                output.close_and_exit()
+            output.info("\t%s, %s, %s", item.oid, item.name, location)
+
+    def _backup_copy(self, backup_info, dest, tablespaces=None,
+                     remote_command=None, safe_horizon=None):
+        """
+        Perform the actual copy of the base backup for recovery purposes
+
+        First, it copies one tablespace at a time, then the PGDATA directory.
+
+        Bandwidth limitation, according to configuration, is applied in
+        the process.
+
+        TODO: manage configuration files if outside PGDATA.
+
+        :param barman.infofile.BackupInfo backup_info: the backup to recover
+        :param str dest: the destination directory
+        :param dict[str,str]|None tablespaces: a tablespace
+            name -> location map (for relocation)
+        :param str|None remote_command: default None. The remote command to
+            recover the base backup, in case of remote backup.
+        :param datetime.datetime|None safe_horizon: anything after this time
+            has to be checked with checksum
+        """
+
+        # Set a ':' prefix to remote destinations
+        dest_prefix = ''
+        if remote_command:
+            dest_prefix = ':'
+
+        # Create the copy controller object, specific for rsync,
+        # which will drive all the copy operations. Items to be
+        # copied are added before executing the copy() method
+        controller = RsyncCopyController(
+            path=self.server.path,
+            ssh_command=remote_command,
+            network_compression=self.config.network_compression,
+            safe_horizon=safe_horizon,
+            retry_times=self.config.basebackup_retry_times,
+            retry_sleep=self.config.basebackup_retry_sleep,
+        )
+
+        # Dictionary for paths to be excluded from rsync
+        exclude_and_protect = []
+
+        # Process every tablespace
+        if backup_info.tablespaces:
+            for tablespace in backup_info.tablespaces:
+                # By default a tablespace goes in the same location where
+                # it was on the source server when the backup was taken
+                location = tablespace.location
+                # If a relocation has been requested for this tablespace
+                # use the user provided target directory
+                if tablespaces and tablespace.name in tablespaces:
+                    location = tablespaces[tablespace.name]
+
+                # If the tablespace location is inside the data directory,
+                # exclude and protect it from being deleted during
+                # the data directory copy
+                if location.startswith(dest):
+                    exclude_and_protect += [location[len(dest):]]
+
+                # Exclude and protect the tablespace from being deleted during
+                # the data directory copy
+                exclude_and_protect.append("/pg_tblspc/%s" % tablespace.oid)
+
+                # Add the tablespace directory to the list of objects
+                # to be copied by the controller
+                controller.add_directory(
+                    label=tablespace.name,
+                    src='%s/' % backup_info.get_data_directory(tablespace.oid),
+                    dst=dest_prefix + location,
+                    bwlimit=self.config.get_bwlimit(tablespace),
+                    item_class=controller.TABLESPACE_CLASS
+                    )
+
+        # Add the PGDATA directory to the list of objects to be copied
+        # by the controller
+        controller.add_directory(
+            label='pgdata',
+            src='%s/' % backup_info.get_data_directory(),
+            dst=dest_prefix + dest,
+            bwlimit=self.config.get_bwlimit(),
+            exclude=[
+                '/pg_xlog/*',
+                '/pg_log/*',
+                '/recovery.conf',
+                '/postmaster.pid'],
+            exclude_and_protect=exclude_and_protect,
+            item_class=controller.PGDATA_CLASS
+        )
+
+        # TODO: Manage different location for configuration files
+        # TODO: that were not within the data directory
+
+        # Execute the copy
+        try:
+            controller.copy()
+        # TODO: Improve the exception output
+        except CommandFailedException as e:
+            msg = "data transfer failure"
+            raise DataTransferFailure.from_command_error(
+                'rsync', e, msg)
+
+
+class IncrementalRecoveryExecutor(RecoveryExecutor):
+    def __init__(self, backup_manager):
+        super(IncrementalRecoveryExecutor, self).__init__(backup_manager)
+
+    def _prepare_tablespaces(self, backup_info, cmd, dest, tablespaces):
+        """
+        Do nothing. Useless for incr implementation.
+        :param barman.infofile.BackupInfo backup_info: backup representation
+        :param barman.fs.UnixLocalCommand cmd: Object for
+            filesystem interaction
+        :param str dest: destination dir for the recovery
+        :param dict tablespaces: dict of all the tablespaces and their location
+        """
+        pass
+
+    def _retrieve_safe_horizon(self, recovery_info, backup_info, dest):
+        """
+        Sets safe_horizon to None. Useless for incr implementation.
+        :param dict recovery_info: Dictionary containing all the recovery
+            parameters
+        :param barman.infofile.BackupInfo backup_info: a backup representation
+        :param str dest: recovery destination directory
+        """
+        recovery_info['safe_horizon'] = None
+
+    def _backup_copy(self, backup_info, dest, tablespaces=None,
+                     remote_command=None, safe_horizon=None):
+        """
+        Perform the actual copy of the base backup for recovery purposes
+
+        Bandwidth limitation, according to configuration, is applied in
+        the process.
+
+        TODO: manage configuration files if outside PGDATA.
+
+        :param barman.infofile.BackupInfo backup_info: the backup to recover
+        :param str dest: the destination directory
+        :param dict[str,str]|None tablespaces: a tablespace
+            name -> location map (for relocation)
+        :param str|None remote_command: default None. The remote command to
+            recover the base backup, in case of remote backup.
+        :param datetime.datetime|None safe_horizon: for compatibility with
+            Rsync implementation
+        """
+
+        for b in self.backup_manager.get_restore_path(backup_info.backup_id):
+            output.info('Starting recovery of %s' % b)
+            info = self.backup_manager.get_backup(b)
+            rsync_options = []
+            if self.config.network_compression:
+                rsync_options.append('-z')
+
+            if self.config.incr_rsync_options:
+                rsync_options += filter(lambda x: len(x) > 0,
+                                        self.config.incr_rsync_options.split())
+
+            options = []
+
+            if rsync_options:
+                options += ['-R', '" ' + ' '.join(rsync_options) + '"']
+
+            if self.config.bandwidth_limit:
+                options += ['-w', str(self.config.bandwidth_limit)]
+
+            t = self.config.tablespace_bandwidth_limit
+            tsp_bwlims = []
+            tsps = []
+            if info.tablespaces:
+                if not tablespaces:
+                    tablespaces = {}
+                for tablespace in info.tablespaces:
+                    tsps.append(str(tablespace.oid) + ':' +
+                                str(tablespaces.get(tablespace.name,
+                                                    tablespace.location)))
+                    if t and tablespace.name in t:
+                        tsp_bwlims.append(str(tablespace.oid) + ':' +
+                                          str(t[tablespace.name]))
+            if tsps:
+                options += ['-T', ','.join(tsps)]
+            if tsp_bwlims:
+                options += ['-W', ','.join(tsp_bwlims)]
+
+            if self.config.incr_extra_args:
+                options += self.config.incr_extra_args.split()
+
+            if remote_command is not None:
+                bkup_path = info.get_data_directory()
+                if self.config.incr_rsync_relpath:
+                    bkup_path = '/' + \
+                                os.path.relpath(bkup_path,
+                                                self.config.incr_rsync_relpath)
+                rst = UnixRemoteCommand(remote_command,
+                                        path=self.server.path)
+                rpath = self.config.incr_host + ':' + bkup_path
+            else:
+                rst = UnixLocalCommand(path=self.server.path)
+                rpath = info.get_data_directory()
+
+            res = rst.cmd('barman-incr -D %s -p %d %s -c %s -b %s restore' % (
+                dest, self.config.incr_parallel, ' '.join(options),
+                info.incr_compress, rpath))
+            for l in rst.cmd.err.splitlines():
+                _logger.info(l.rstrip())
+            if res != 0:
+                raise FsOperationFailed('Unable to run barman-incr')
